@@ -7,6 +7,7 @@ Wraps the CLI optimizer logic into a web UI deployable to GCP Cloud Run.
 import copy
 import io
 import json
+import time
 import os
 import re
 import tempfile
@@ -111,10 +112,17 @@ def call_gemini(api_key, prompt):
             "responseMimeType": "application/json",
         },
     }
-    resp = http_requests.post(url, json=payload, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    # Retry on 403/429 rate limits with backoff
+    for retry in range(3):
+        resp = http_requests.post(url, json=payload, timeout=120)
+        if resp.status_code in (403, 429):
+            wait = (retry + 1) * 5
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    resp.raise_for_status()  # Final raise if all retries failed
 
 
 def build_prompt(sections, keywords, feedback=None, job_description=None):
@@ -424,6 +432,9 @@ def optimize():
             feedback = None
 
             for attempt in range(1, MAX_RETRIES + 1):
+                if attempt > 1:
+                    yield sse_msg("info", "⏳ Waiting 3s before retry...")
+                    time.sleep(3)
                 yield sse_msg("status", f"🤖 Attempt {attempt}/{MAX_RETRIES} — Calling Gemini...")
                 prompt = build_prompt(sections, keywords, feedback, job_description)
 
