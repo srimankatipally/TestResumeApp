@@ -20,9 +20,11 @@ app = Flask(__name__)
 
 DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDZBdPvjWxwq1dW5Mu3I9Bg5Xfi03XM034")
 GEMINI_MODEL = "gemini-2.5-flash"
+GCP_PROJECT = os.environ.get("GCP_PROJECT", "gen-lang-client-0682496991")
+GCP_REGION = os.environ.get("GCP_REGION", "us-central1")
+USE_VERTEX = os.environ.get("USE_VERTEX", "true").lower() == "true"
 MIN_COUNT = 13
 MAX_RETRIES = 5
-
 
 # ═══════════════════════════════════════════════════════════
 # Core optimizer logic (from ats_optimizer.py)
@@ -102,8 +104,22 @@ def extract_sections(doc):
     return sections
 
 
+def _get_vertex_token():
+    """Get access token from the GCP metadata server (works on Cloud Run)."""
+    try:
+        resp = http_requests.get(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+            headers={"Metadata-Flavor": "Google"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+    except Exception:
+        return None
+
+
 def call_gemini(api_key, prompt):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    """Call Gemini — uses Vertex AI on Cloud Run, falls back to API key locally."""
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -112,9 +128,27 @@ def call_gemini(api_key, prompt):
             "responseMimeType": "application/json",
         },
     }
+
+    # Try Vertex AI first (higher rate limits, no API key needed on Cloud Run)
+    token = None
+    if USE_VERTEX:
+        token = _get_vertex_token()
+
+    if token:
+        url = (
+            f"https://{GCP_REGION}-aiplatform.googleapis.com/v1/"
+            f"projects/{GCP_PROJECT}/locations/{GCP_REGION}/"
+            f"publishers/google/models/{GEMINI_MODEL}:generateContent"
+        )
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    else:
+        # Fallback: API key mode (local dev)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+
     # Retry on 403/429 rate limits with backoff
     for retry in range(3):
-        resp = http_requests.post(url, json=payload, timeout=120)
+        resp = http_requests.post(url, json=payload, headers=headers, timeout=120)
         if resp.status_code in (403, 429):
             wait = (retry + 1) * 5
             time.sleep(wait)
