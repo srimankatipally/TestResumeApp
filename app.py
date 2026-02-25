@@ -136,17 +136,29 @@ def call_gemini(api_key, prompt):
 
     if token:
         url = (
-            f"https://{GCP_REGION}-aiplatform.googleapis.com/v1/"
+            f"https://{GCP_REGION}-aiplatform.googleapis.com/v1beta1/"
             f"projects/{GCP_PROJECT}/locations/{GCP_REGION}/"
             f"publishers/google/models/{GEMINI_MODEL}:generateContent"
         )
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    else:
-        # Fallback: API key mode (local dev)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-        headers = {"Content-Type": "application/json"}
 
-    # Retry on 403/429 rate limits with backoff
+        # Try Vertex AI, fall back to API key if it fails
+        for retry in range(3):
+            resp = http_requests.post(url, json=payload, headers=headers, timeout=120)
+            if resp.status_code in (403, 429):
+                wait = (retry + 1) * 5
+                time.sleep(wait)
+                continue
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                # Vertex AI failed — fall back to API key mode below
+                break
+
+    # Fallback: API key mode
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
     for retry in range(3):
         resp = http_requests.post(url, json=payload, headers=headers, timeout=120)
         if resp.status_code in (403, 429):
@@ -156,7 +168,7 @@ def call_gemini(api_key, prompt):
         resp.raise_for_status()
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
-    resp.raise_for_status()  # Final raise if all retries failed
+    resp.raise_for_status()
 
 
 def build_prompt(sections, keywords, feedback=None, job_description=None):
